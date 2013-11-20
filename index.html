@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="Content-Type" content="text/html;charset=UTF-8">
+    <meta name="viewport" content="initial-scale=1.0, user-scalable=no" />
+    <style type="text/css">
+      html { height: 100%; }
+      body { height: 100%; margin: 0; padding: 0; }
+      #left {
+        height: 100%;
+        width: 20%;
+        float: left;
+      }
+      #map-canvas {
+        height: 100%;
+        width: 80%;
+        float: right;
+      }
+      #out {
+        height: 100%;
+        overflow-y: scroll;
+      }
+      .label {
+        background-color: white;
+        text-align: center;
+        vertical-align: center;
+        width: 16px;
+        height: 16px;
+        border-radius: 8px;
+        border: 1px solid black;
+      }
+      .weight {
+        background-color: #ccc;
+        font-size: 8px !important;
+        text-align: center;
+        vertical-align: center;
+        width: 19px;
+        height: 10px;
+        border: 1px solid #555;
+      }
+    </style>
+    <script type="text/javascript"
+      src="https://maps.googleapis.com/maps/api/js?key=AIzaSyDOBoOdp4VbqnWI25dUcI6_phsxD059hrc&sensor=false&libraries=geometry">
+    </script>
+    <!--script type="text/javascript" src="SimplexJS.js"></script-->
+    <script type="text/javascript" src="markerwithlabel.js"></script>
+    <script type="text/javascript" src="convex_hull.js"></script> 
+    <script type="text/javascript" src="http://code.jquery.com/jquery-1.10.1.min.js"></script>
+    
+    
+    <script type="text/javascript">
+      var map;
+      var state = "svk";
+      var name = [];
+      var pos = [];
+      var N = pos.length;
+      var D = [];
+      var mind;
+      var bound;
+      var opt;
+
+      
+      var pi = [];
+      var path;
+      var lines = [];
+      var polylines = [];
+      var edge_markers = [];
+      var xchg_lines = [];
+      var delay = 100;
+      
+      var algs_button, state_button, out;      
+      var refreshIntervalId;
+
+      var sol; // LP solution
+      
+      function make_lat_lng(obj) {
+        return new google.maps.LatLng(obj.lb, obj.mb);
+      }
+
+      function make_polyline(p, w, col) {
+        return new google.maps.Polyline({
+          path: p,
+          geodesic: true,
+          strokeColor: col,
+          strokeOpacity: 0.7,
+          strokeWeight: 4*w,
+        });
+      }
+      
+      function make_path(pi) {
+        clear_path();
+        var p = [];
+        for (var i=0; i<pi.length; ++i) {
+          p[i] = pos[pi[i]];
+        }
+        path = make_polyline(p, 1, "#00f");
+        path.setMap(map);
+      }
+      
+      function clear_path() {
+        if (path) {
+          path.setMap(null);
+        }
+      }
+      
+      function reverse(i,j) {
+        for (; i < j; ++i, --j) {
+          t = pi[i];
+          pi[i] = pi[j];
+          pi[j] = t;
+        }
+      }
+      
+      function dist(pi) {
+        var s = 0;
+        for (var i=1; i<pi.length; ++i) {
+          s += D[pi[i-1]][pi[i]];
+        }
+        return s + " (" + Math.round((s/opt)*100000)/1000 + "%)";
+      }
+      
+      function simple_dist() {
+        for (var i=0; i<N; ++i) {
+          D[i] = [];
+          for (var j=0; j<N; ++j) {
+            D[i][j] = google.maps.geometry.spherical.computeDistanceBetween(pos[i], pos[j]);
+          }
+        }
+      }
+      
+      function sqr(x) { return x*x; }
+      
+      function min_dist() {
+        var m = sqr(pos[0].lat()-pos[1].lat()) + sqr(pos[0].lng()-pos[1].lng());
+        for (var i=0; i<N; ++i) {
+          for (var j=i+1; j<N; ++j) {
+            d = sqr(pos[i].lat()-pos[j].lat()) + sqr(pos[i].lng()-pos[j].lng());
+            if (d < m) m = d;
+          }
+        }
+        return Math.sqrt(m);
+      }
+      
+      function read_json(filename) {
+        var request = new XMLHttpRequest();
+        request.open("GET", filename, false);
+        request.send();
+        var myObject = eval('(' + request.responseText + ')');
+        return myObject;
+      }
+
+      function read_cities(filename) {
+        var cities = read_json(filename);
+        bounds = new google.maps.LatLngBounds();
+        name = [];
+        pos = [];
+        for (var i=0; i<cities.length; ++i) {
+          var p = make_lat_lng(cities[i]);
+          name.push(cities[i].name);
+          pos.push(p);
+          bounds.extend(p);
+        }
+        N = pos.length;
+        map.fitBounds(bounds);
+      }
+      
+      function make_markers() {
+        for (var i=0; i<N; ++i) {
+          var s = i + " " + name[i];
+          var marker = new MarkerWithLabel({
+                map: map,
+                position: pos[i],
+                icon: {
+                  path: google.maps.SymbolPath.CIRCLE,
+                  scale: 0,
+                },
+                title: s,
+                labelContent: "" + i,
+                labelAnchor: new google.maps.Point(8, 8),
+                labelClass: "label",
+          });
+        }
+      }
+
+      function fract(w) {
+        for (var i=2; i<11; ++i) {
+          if (Math.abs(Math.round(w*i) - w*i) < 0.001) {
+            return Math.round(w*i) + '/' + i;
+          }
+        }
+        return "" + Math.round(w*100)/100;
+      }
+      
+      function clear_edge_markers() {
+        for (i=0; i<edge_markers.length; ++i) {
+          edge_markers[i].setMap(null);
+        }        
+        edge_markers = [];
+      }
+      
+      function edge_marker(i,j,w) {
+        var ww = fract(w);
+        var marker = new MarkerWithLabel({
+              map: map,
+              position: new google.maps.LatLng((pos[i].lat()+pos[j].lat())/2.0, (pos[i].lng()+pos[j].lng())/2.0),
+              icon: {
+                path: google.maps.SymbolPath.CIRCLE,
+                scale: 0,
+              },
+              title: ww,
+              labelContent: ww,
+              labelAnchor: new google.maps.Point(5,5),
+              labelClass: "weight",
+        });
+        edge_markers.push(marker);
+      }
+
+      function clear_lines() {
+        for (i=0; i<lines.length; ++i) {
+          lines[i].setMap(null);
+        }        
+        lines = [];
+      }
+      
+      function clear_xchg_lines() {
+        for (i=0; i<xchg_lines.length; ++i) {
+          xchg_lines[i].setMap(null);
+        }        
+        xchg_lines = [];
+      }
+      
+      function make_line(i,j,w) {
+        if (i < 0 || j < 0 || i >= pos.length || j >= pos.length) {
+          console.log("out of bounds");
+          return;
+        }
+        var l = make_polyline([pos[i], pos[j]], w, "#00f");
+        l.setMap(map);
+        lines.push(l);
+      }
+
+      function make_xchg_line(i,j) {
+        var l = make_polyline([pos[i], pos[j]], 1, "#f00");
+        l.setMap(map);
+        xchg_lines.push(l);
+      }
+
+      function save(obj) {
+        out.append(JSON.stringify(obj).replace('},', "},\n", 'g').replace('],', "],\n", 'g'));
+      }
+
+      var I = 0, J = 0;
+      var C = [];
+      var GEO = [];
+      
+      function geocode_scraper() {
+        I = 0;
+        window.setInterval(function() {
+          var geocoder = new google.maps.Geocoder();
+          if (I >= C.length) return;
+          var address = C[I] + ", USA", ii=I, cc = C[I];
+          ++I;
+          geocoder.geocode( { 'address': address}, function(results, status) {
+            if (status == google.maps.GeocoderStatus.OK) {
+              loc = results[0].geometry.location;
+              GEO[ii] = {"lb" : loc.lat(), "mb" : loc.lng(), "name" : cc};
+              console.log(ii + " " + cc);
+            }
+          });
+        }, delay);
+      }
+      
+      var PATHS = { 0: {} }, CNT = 0;
+      //PATHS = read_json("svk-paths.txt");
+      
+      function next_ij() {
+        ++J;
+        if (J >= pos.length) {
+          ++I; J = I+1;
+          if (I < pos.length-1 && !(''+I in PATHS)) {
+            PATHS[''+I] = {};
+          }
+        }
+      }
+      
+      function paths_scraper() {
+        I = 0;
+        J = 1;
+        window.setInterval(function() {
+          directionsService = new google.maps.DirectionsService();
+          if (J >= pos.length) return;
+          var ii = I, jj = J;
+          while (I in PATHS && J in PATHS[I] && PATHS[I][J].length) {
+            next_ij();
+          }
+          var request = {
+            origin: pos[ii],
+            destination: pos[jj],
+            travelMode: google.maps.TravelMode.DRIVING
+          };
+          
+          directionsService.route(request, function(result, status) {
+            if (status == google.maps.DirectionsStatus.OK) {
+              console.log(ii+" "+jj);
+              (PATHS[ii])[jj] = result.routes[0].overview_path;
+              ++CNT;
+              //directionsDisplay.setDirections(result);
+            }
+          });
+        }, delay);
+      }
+
+      function nn() {
+        var used = [true];
+        for (var i=1; i<N; ++i) used.push(false);
+        var c = 0;
+        pi = [0];
+        for (var i=1; i<N; ++i) {
+          var min = 9999999, k = 0;
+          for (var j=0; j<N; ++j) {
+            if (!used[j] && D[c][j] < min) {
+              min = D[c][j];
+              k = j;
+            }
+          }
+          pi.push(k);
+          c = k;
+          used[k] = true;
+        }
+        pi.push(pi[0]);
+        make_path(pi);
+        out.append(dist(pi) + "\n");
+      }
+
+      function opt2_next() {
+        if (I == -1) {
+          for (var i=0; i<N; ++i) {
+            for (var j=i+2; j<N; ++j) {
+              if (D[pi[i]][pi[i+1]] + D[pi[j]][pi[j+1]] >
+                  D[pi[i]][pi[j]] + D[pi[i+1]][pi[j+1]]) {
+                  make_xchg_line(pi[i],pi[j]);
+                  make_xchg_line(pi[i+1],pi[j+1]);
+                  I = i;
+                  J = j;
+                  return;
+              }
+            }
+          }
+          clearInterval(refreshIntervalId);
+        } else {
+          reverse(I+1, J);
+          clear_path();
+          clear_xchg_lines();
+          make_path(pi);
+          out.append(dist(pi) + "\n");
+          I = -1;
+        }
+      }
+
+      function clear_polylines() {
+        for (i=0; i<polylines.length; ++i) {
+          polylines[i].setMap(null);
+        }        
+        polylines = [];
+      }
+      
+      function convex_hull(points, color) {
+        points.sort(sortPointY);
+        points.sort(sortPointX);
+        draw_hull(points, color);
+      }
+      
+      function convex_hull2(indices, color) {
+        var r=mind/2; // with margin
+        var pts = []
+        for (i=0; i<indices.length; ++i) {
+          var p = pos[indices[i]], j=0;
+          for (j=0; j<360; j+=10) {
+            pts.push(new google.maps.LatLng(p.lat()+r*Math.cos(j*Math.PI/180), p.lng()+r*Math.sin(j*Math.PI/180)));
+          }
+        }
+        convex_hull(pts, color);
+      }
+      
+      function draw_hull(points, color) {
+        hullPoints = [];
+        chainHull_2D( points, points.length, hullPoints );
+        var op = 0.3;
+        if (color == "#0f0") op = 0.6;
+        else if (color == "#000" || color == "#fff") op = 0.9;
+        var polyline = new google.maps.Polygon({
+          map: map,
+          paths: hullPoints, 
+          fillColor: color,
+          strokeWidth: 2, 
+          fillOpacity: op, 
+          strokeColor: color,
+          strokeOpacity: op+0.1,
+        });
+        polylines.push(polyline);
+      }
+
+      function lp_next() {
+        if (I >= sol.length) {
+          clearInterval(refreshIntervalId);
+          return;
+        }
+        t = sol[I][0];
+        ss = sol[I][1];
+        if (t == "solution") {
+          clear_lines();
+          clear_polylines();
+          clear_edge_markers();
+          
+          z = 0;
+          sum = 0;
+          for (i = 0; i < N; i++) {
+            for (j = i+1; j < N; j++) {
+              w = Math.round(ss[z] * 100) / 100;
+              if (w > 0) {
+                make_line(i,j,w);
+                //if (w < 1) edge_marker(i,j,ss[z]);
+                sum += D[i][j] * ss[z];
+              }
+              z++;
+            }
+          }
+          out.append(sum + " (" + Math.round((sum/opt)*100000)/1000 + "%)\n");
+        } else if (t == "subtour") {
+          convex_hull2(ss, "#f00");
+        } else if (t == "comb") {
+          console.log("comb: "+ss[0]);
+          convex_hull2(ss[0], "#f00");
+          convex_hull2(ss[1][0], "#0f0");
+          convex_hull2(ss[1][1], "#0f0");
+          convex_hull2(ss[1][2], "#0f0");
+        } else if (t == "fix") {
+          var i=ss[0], j=ss[1], w=ss[2];
+          if (w==0) {
+            convex_hull2([i,j], "#fff");
+          } else {
+            convex_hull2([i,j], "#000");
+          }
+        }
+        ++I;
+      }      
+      
+      function read_sol(filename) {
+      }
+
+      function initialize() {
+        map = new google.maps.Map(document.getElementById("map-canvas"));
+        read_cities(state+".in");
+        make_markers();
+        simple_dist();
+        mind = min_dist();
+        //dsave(D);
+        //geocode_scraper();
+        //paths_scraper();
+      }
+
+      function clear() {
+        if (refreshIntervalId) clearInterval(refreshIntervalId);
+        clear_path();
+        clear_lines();
+        clear_xchg_lines();
+        clear_polylines();
+        out.text('');
+      }
+
+      $(document).ready(function () {
+        algs_button = $('[name=algs]');
+        state_button = $('[name=state]');
+        next_button = $('#next');
+        play_button = $('#play');
+        out = $('#out');
+
+        state_button.val(state);
+        algs_button.val('-');
+        
+          if (state == "svk") {
+            opt = 1252919.51863;
+          } else if (state == "usa") {
+            opt = 17102542.180039395;
+          }
+        
+        
+        state_button.change(function () {
+          clear();
+          state = state_button.val();
+          algs_button.val('-');
+          // TODO
+          if (state == "svk") {
+            opt = 1252919.51863;
+          } else if (state == "usa") {
+            opt = 17102542.180039395;
+          }
+          initialize();
+        });
+
+        algs_button.change(function () {
+          clear();
+          switch (algs_button.val()) {
+            case "nn":
+            case "opt2":
+              I = -1;
+              nn();
+              break;
+            case "lp":
+              I = 0;
+              sol = read_json(state+".sol");
+              break;
+          }
+        });
+      
+        next_button.click(function() {
+          switch (algs_button.val()) {
+            case "opt2":
+              opt2_next();
+              break;
+            case "lp":
+              lp_next();
+              break;
+          }
+        });
+       
+        play_button.click(function() {
+          switch (algs_button.val()) {
+            case "opt2":
+              refreshIntervalId = window.setInterval(opt2_next, delay);
+              break;
+            case "lp":
+              refreshIntervalId = window.setInterval(lp_next, delay);
+              break;
+          }
+        });
+       
+      });
+      
+      google.maps.event.addDomListener(window, 'load', initialize);
+    </script>
+  </head>
+  
+  <body>
+    <div id="left">
+      <select name="state">
+        <option value="svk">Slovakia</option>
+        <option value="usa">USA</option>
+      </select>
+      
+      <select name="algs">
+        <option value="-">-</option>
+        <option value="nn">Nearest Neighbor</option>
+        <option value="opt2">2-Opt</option>
+        <option value="lp">LP</option>
+      </select>
+      
+      <input id="next" type="button" value="next">
+      <input id="play" type="button" value="play">
+      <pre id="out"></pre>
+    </div>
+    <div id="map-canvas"/>
+  </body>
+</html>
